@@ -19,8 +19,8 @@
 #include "mpu6050.h"
 #include <string.h>
 #include <stdio.h>
-#include "motor_control.h"
-#include "servo_control.h"
+//#include "motor_control.h"
+//#include "servo_control.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
