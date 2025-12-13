@@ -12,6 +12,7 @@
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
+#include <math.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -41,9 +42,26 @@
 
 /* USER CODE BEGIN PV */
 MPU6050_t mpu6050;
-int8_t current_speed_cmd = 0;
+
+// MARK AS VOLATILE: Shared between Main Loop (Writer) and Interrupt (Reader)
+volatile int8_t current_speed_cmd = 0;
 uint8_t current_angle_cmd = SERVO_CENTER_ANGLE;
 uint32_t last_pub_time = 0;
+
+// --- Encoder & Velocity Globals ---
+volatile int32_t encoder_curr = 0;
+volatile int32_t encoder_prev = 0;
+float v_actual = 0.0f;
+
+// --- PID Controller State ---
+typedef struct {
+    float error_integral;
+    float prev_error;
+} PID_State_t;
+
+PID_State_t motor_pid = {0.0f, 0.0f};
+
+// DELETE THIS: extern int8_t motor_speed_cmd; <--- Caused the variable mismatch
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -54,23 +72,85 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/**
+ * @brief Converts raw encoder ticks to linear velocity (m/s)
+ * Handles 16-bit timer wrapping automatically via casting.
+ */
+float Calculate_Velocity(void) {
+    // 1. Read current counter from TIM2
+    encoder_curr = __HAL_TIM_GET_COUNTER(&htim2);
+
+    // 2. Calculate delta (cast to int16_t handles 0 -> 65535 wrap-around)
+    int16_t delta_ticks = (int16_t)(encoder_curr - encoder_prev);
+
+    // 3. Update previous count
+    encoder_prev = encoder_curr;
+
+    // 4. Convert to m/s
+    // v = (delta / dt) * (circumference / counts_per_rev)
+    float raw_vel = (delta_ticks / DT) * ((3.14159f * WHEEL_DIAMETER) / COUNTS_PER_REV);
+
+    // 5. Low-Pass Filter to remove quantization noise
+    static float v_smooth = 0.0f;
+    v_smooth = (VEL_FILTER_ALPHA * raw_vel) + ((1.0f - VEL_FILTER_ALPHA) * v_smooth);
+
+    return v_smooth;
+}
+
+/**
+ * @brief Computes PID output
+ * @param target_vel Target velocity in m/s
+ * @param current_vel Actual velocity in m/s
+ * @return Motor PWM command (-100 to 100)
+ */
+int8_t PID_Compute(float target_vel, float current_vel) {
+    float error = target_vel - current_vel;
+
+    // Proportional Term
+    float P = PID_KP * error;
+
+    // Integral Term (with Anti-Windup)
+    motor_pid.error_integral += error * DT;
+
+    // Clamp Integral to prevent runaway
+    // (Simple clamping; can be improved based on output saturation)
+    float I = PID_KI * motor_pid.error_integral;
+    if (I > MAX_PWM_OUTPUT) motor_pid.error_integral = MAX_PWM_OUTPUT / PID_KI;
+    if (I < MIN_PWM_OUTPUT) motor_pid.error_integral = MIN_PWM_OUTPUT / PID_KI;
+    I = PID_KI * motor_pid.error_integral;
+
+    // Derivative Term
+    float D = PID_KD * (error - motor_pid.prev_error) / DT;
+    motor_pid.prev_error = error;
+
+    // Sum
+    float output = P + I + D;
+
+    // Final Clamping to Motor limits
+    if (output > MAX_PWM_OUTPUT) output = MAX_PWM_OUTPUT;
+    if (output < MIN_PWM_OUTPUT) output = MIN_PWM_OUTPUT;
+
+    return (int8_t)output;
+}
+
 void Robot_Update_Loop(void) {
     // 1. Check for incoming ROS2 commands (Non-blocking)
-    ROS_CheckForCommand(&current_speed_cmd, &current_angle_cmd);
+    // This updates the global 'current_speed_cmd'
+	ROS_CheckForCommand((int8_t*)&current_speed_cmd, &current_angle_cmd);
 
     // 2. Apply Actuation
-    Motor_SetSpeed(current_speed_cmd);
+    // REMOVED: Motor_SetSpeed(current_speed_cmd); <--- This was causing the fight!
+
+    // Servo is still open-loop, so this stays here:
     Servo_SetAngle(current_angle_cmd);
 
     // 3. Telemetry Publishing (10Hz)
+    // Keep sensor reading HERE, not in the Interrupt.
     if (HAL_GetTick() - last_pub_time >= (1000 / SENSOR_PUB_RATE_HZ)) {
-        // Read IMU (Blocking I2C, be careful or move to DMA later)
         MPU6050_Read_All(&hi2c1, &mpu6050);
         MPU6050_Calculate_Angles(&mpu6050);
-
-        // Send Data
         ROS_SendTelemetry(Encoder_GetCount(), &mpu6050);
-
         last_pub_time = HAL_GetTick();
     }
 }
@@ -79,7 +159,31 @@ void Robot_Update_Loop(void) {
 // Redirect Interrupts to specific modules
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM1) { // 200Hz Control Loop
-         Encoder_Update();
+
+    	Encoder_Update();
+
+        // 1. Calculate Actual Velocity
+        v_actual = Calculate_Velocity();
+
+        // 2. Determine Setpoint
+        // USE 'current_speed_cmd' HERE
+        float v_target = ((float)current_speed_cmd / 100.0f) * MAX_LINEAR_VELOCITY;
+
+        // 3. Compute PID Output
+        int8_t pid_output = PID_Compute(v_target, v_actual);
+
+        // 4. Handle Stop Condition (Reset PID when stopped to prevent windup)
+        if (current_speed_cmd == 0) {
+            pid_output = 0;
+            motor_pid.error_integral = 0;
+            motor_pid.prev_error = 0;
+        }
+
+        // 5. Apply to Motor (The Interrupt now OWNS the motor)
+        Motor_SetSpeed(pid_output);
+
+        // REMOVED: readIMU() and publishSensorData()
+        // We do this in the main loop now to avoid blocking the interrupt.
     }
 }
 

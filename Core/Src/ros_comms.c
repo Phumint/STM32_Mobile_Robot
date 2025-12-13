@@ -47,29 +47,42 @@ void ROS_CheckForCommand(int8_t* out_speed, uint8_t* out_angle) {
 }
 
 void ROS_SendTelemetry(int32_t enc, MPU6050_t* mpu) {
-    char buffer[128];
-    // Keep format concise
-    sprintf(buffer, "$ENC,%ld;IMU,%d,%d,%.2f*\r\n",
+    char buffer[200]; // Increased buffer size to be safe
+
+    // Format: $ENC,count;IMU,ax,ay,az,gx,gy,gz,roll,pitch*
+    // Scaling: Accel*1000, Gyro*100, Euler*100 (Integers are faster to print)
+    sprintf(buffer, "$ENC,%ld;IMU,%d,%d,%d,%d,%d,%d,%d,%d*\r\n",
             enc,
-            (int)(mpu->accel_x * 100),
+            (int)(mpu->accel_x * 1000),
+            (int)(mpu->accel_y * 1000),
+            (int)(mpu->accel_z * 1000),
+            (int)(mpu->gyro_x * 100),
+            (int)(mpu->gyro_y * 100),
             (int)(mpu->gyro_z * 100),
-            mpu->roll); // Example subset
+            (int)(mpu->roll * 100),
+            (int)(mpu->pitch * 100)
+           );
 
     HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), 50);
 }
-
 // Call this from HAL_UART_RxCpltCallback
+/* ros_comms.c */
+
 void ROS_UART_ISR_Handler(void) {
+    // 1. Ignore Newline/Carriage Return to prevent offset issues
+    if (rx_byte == '\n' || rx_byte == '\r') {
+         HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+         return;
+    }
+
     if (rx_index < UART_RX_BUF_SIZE - 1) {
         if (rx_byte == '*') {
-            // End of message
             rx_buffer[rx_index] = '\0';
             msg_received_flag = 1;
         } else {
             rx_buffer[rx_index++] = rx_byte;
         }
     } else {
-        // Buffer overflow protection
         rx_index = 0;
     }
     HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
